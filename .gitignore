@@ -17,3 +17,7 @@ Thumbs.db
 .idea/
 *.swp
 *~
+
+# Dense reproducible predictions and exploratory reruns are local artifacts
+results/**/predictions/
+results/exploratory_rerun/

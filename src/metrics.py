@@ -24,6 +24,14 @@ def pinball_loss_matrix(
     y = np.asarray(y_true, dtype=float).reshape(-1, 1)
     yq = np.asarray(y_quantiles, dtype=float)
     q = np.asarray(quantiles, dtype=float).reshape(1, -1)
+    if yq.shape != (len(y), q.size) or len(y) == 0:
+        raise ValueError("Forecast shape must be (N, Q), matching nonempty truth and quantile levels")
+    if not all(np.isfinite(a).all() for a in (y, yq, q)):
+        raise ValueError("Truth, forecasts and levels must be finite")
+    if np.any((q <= 0) | (q >= 1)) or np.any(np.diff(q.ravel()) <= 0):
+        raise ValueError("Quantile levels must be strictly increasing in (0, 1)")
+    if np.any(np.diff(yq, axis=1) < -1e-10):
+        raise ValueError("Crossing quantiles must be fixed explicitly before evaluation")
     diff = y - yq
     return np.maximum(q * diff, (q - 1.0) * diff)
 
@@ -49,8 +57,9 @@ def evaluate_all_metrics(
     """
     y = np.asarray(y_true, dtype=float).ravel()
     yq = np.asarray(y_quantiles, dtype=float)
-    # Enforce non-crossing quantiles via sorting if any minor crossing exists
-    yq_sorted = np.sort(yq, axis=1)
+    # Validate before any indexing; evaluation must not silently repair predictions.
+    pinball_loss_matrix(y, yq)
+    yq_sorted = yq
 
     if y_point is None:
         # 50th percentile (index 49 corresponds to q=0.50)
@@ -58,6 +67,8 @@ def evaluate_all_metrics(
     else:
         y_pt = np.asarray(y_point, dtype=float).ravel()
 
+    if y_pt.shape != y.shape or not np.isfinite(y_pt).all():
+        raise ValueError("Point predictions must match finite truth shape")
     pb_mat = pinball_loss_matrix(y, yq_sorted)
     pb_mean = float(np.mean(pb_mat))
     # Tail pinball loss (q <= 0.10 or q >= 0.90)
@@ -70,7 +81,8 @@ def evaluate_all_metrics(
     err = y - y_pt
     rmse = float(np.sqrt(np.mean(err ** 2)))
     mae = float(np.mean(np.abs(err)))
-    mape = float(np.mean(np.abs(err / y)) * 100.0)
+    nonzero = y != 0
+    mape = float(np.mean(np.abs(err[nonzero] / y[nonzero])) * 100.0) if nonzero.any() else float("nan")
 
     # 80% interval: q=0.10 (idx 9) to q=0.90 (idx 89)
     q10, q90 = yq_sorted[:, 9], yq_sorted[:, 89]

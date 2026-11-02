@@ -5,7 +5,7 @@ Core philosophy (avoiding black-box model stacking):
 1. Interpretable 24-Hour Penalized Cubic Spline Additive Model (GAM-style) capturing:
    - Non-linear U-shaped temperature response (heating & cooling degree splines)
    - Building thermal inertia (short-term lags + 24h/72h rolling mean splines + daily min/max)
-   - Annual seasonal Fourier harmonics & post-2008 load plateau piece-wise trend
+   - Annual seasonal Fourier harmonics & inherited empirical capped time basis
    - Table 5 US Federal Holiday & bridge-day phase-shift into weekend/holiday activity profiles
 2. Two-Stage Probabilistic Modeling (Historical Weather Scenarios + Conditional Residuals):
    - Stage 1 (Weather Trajectory Ensemble): Resample historical multi-year temperature
@@ -19,12 +19,12 @@ Core philosophy (avoiding black-box model stacking):
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+import calendar
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import LassoCV, QuantileRegressor, RidgeCV
+from sklearn.linear_model import RidgeCV
 from sklearn.preprocessing import SplineTransformer
 
 from src.metrics import QUANTILES_99, pinball_loss
@@ -59,6 +59,67 @@ def compute_thermal_features(temp_series: np.ndarray) -> Dict[str, np.ndarray]:
     return feats
 
 
+def weighted_quantile(values, weights, levels=QUANTILES_99):
+    """Use one finite-sample convention for weighted and unweighted mixtures.
+
+    Rescaled weighted midpoints include both endpoints, so equal weights agree
+    with numpy.quantile and the limit as weighting tends to zero is continuous.
+    This is an interpolation convention, not a claim of exact calibration.
+    """
+    values, weights, levels = np.asarray(values, float), np.asarray(weights, float), np.asarray(levels, float)
+    if values.ndim != 1 or values.shape != weights.shape or not len(values):
+        raise ValueError("Samples and weights must have the same nonempty 1D shape")
+    if not all(np.isfinite(x).all() for x in (values, weights, levels)):
+        raise ValueError("Samples, weights and levels must be finite")
+    if np.any(weights < 0) or weights.sum() <= 0 or np.any((levels < 0) | (levels > 1)):
+        raise ValueError("Weights must be nonnegative with positive sum; levels must lie in [0, 1]")
+    positive = weights > 0
+    order = np.argsort(values[positive], kind="stable")
+    v, w = values[positive][order], weights[positive][order]
+    if len(v) == 1:
+        return np.full_like(levels, v[0])
+    if np.ptp(w) == 0:
+        return np.quantile(v, levels)
+    positions = np.cumsum(w) - 0.5 * w
+    positions = (positions - positions[0]) / (positions[-1] - positions[0])
+    return np.interp(levels, positions, v)
+
+
+def historical_scenario_windows(df, target_mask, scenario_years, day_shifts, horizon=None):
+    """Return eligible historical starts using calendar dates, including leap years.
+
+    A Feb-29 origin maps to Feb-28 only in non-leap source years. The hour-ending
+    source trajectory must finish before the first target observation. Diagnostic
+    climatology may request horizon=24; forecast paths use the full target length.
+    """
+    mask = np.asarray(target_mask)
+    if mask.shape != (len(df),) or mask.dtype != bool:
+        raise ValueError("Target mask must be a boolean vector matching the frame")
+    indices = np.flatnonzero(mask)
+    if not len(indices) or np.any(np.diff(indices) != 1):
+        raise ValueError("Forecast target must be a nonempty contiguous hourly window")
+    first = int(indices[0])
+    length = len(indices) if horizon is None else int(horizon)
+    if length <= 0:
+        raise ValueError("Scenario horizon must be positive")
+    row = df.iloc[first]
+    day = pd.Timestamp(row["op_date"])
+    timestamps = pd.Index(df["timestamp"])
+    starts = []
+    metadata = []
+    for year in scenario_years:
+        source_day = day.replace(year=int(year), day=28 if day.month == 2 and day.day == 29 and not calendar.isleap(int(year)) else day.day)
+        for shift in day_shifts:
+            stamp = source_day + pd.Timedelta(days=int(shift), hours=int(row["hour"]))
+            start = int(timestamps.get_indexer([stamp])[0])
+            if start < 0 or start + length > first:
+                continue
+            starts.append(start)
+            metadata.append({"source_year":int(year),"day_shift":int(shift),
+                             "source_start":str(timestamps[start]),"source_end":str(timestamps[start+length-1])})
+    return starts, metadata
+
+
 class HourlySplineGAM:
     """
     24 separate hourly Semi-Parametric Penalized Spline Additive Models (one per hour h=1..24),
@@ -90,24 +151,25 @@ class HourlySplineGAM:
         self.holiday_damping: Dict[int, float] = {}
         self.bridge_damping: Dict[int, float] = {}
 
+    def effective_dayofweek(self, df: pd.DataFrame) -> np.ndarray:
+        """Use the same holiday day type in all features and residual groups."""
+        dow = df["dayofweek"].to_numpy().copy()
+        if self.use_holiday_correction:
+            weekday = dow < 5
+            major = df["is_major_holiday"].to_numpy() == 1
+            minor = (df["is_holiday"].to_numpy() == 1) & ~major
+            bridge = df["is_holiday_bridge"].to_numpy() == 1
+            dow[weekday & (minor | bridge) & ~major] = 5
+            dow[weekday & major] = 6
+        return dow
+
     def _build_calendar_matrix(self, df_h: pd.DataFrame) -> np.ndarray:
         """
         Build calendar, day-type (with optional holiday phase-shift), annual Fourier,
         and linear trend basis for a fixed hour `h`.
         """
         n = len(df_h)
-        dow = df_h["dayofweek"].to_numpy().copy()
-
-        if self.use_holiday_correction:
-            # Phase-shift weekday major federal holidays to Sunday (dow=6) and minor/bridge weekday holidays to Saturday (dow=5)
-            # Only apply additional indicator on Thanksgiving/weekday major holidays to avoid double-discounting Sunday Christmas
-            is_wkday = dow < 5
-            is_maj = df_h["is_major_holiday"].to_numpy() == 1
-            is_hol = (df_h["is_holiday"].to_numpy() == 1) & (~is_maj)
-            is_brg = df_h["is_holiday_bridge"].to_numpy() == 1
-            dow[is_maj & is_wkday] = 6
-            dow[is_hol & is_wkday] = 5
-            dow[is_brg & is_wkday] = 5
+        dow = self.effective_dayofweek(df_h)
 
         # One-hot day of week (0..6)
         dow_oh = np.eye(7)[dow]
@@ -125,8 +187,8 @@ class HourlySplineGAM:
         # Interaction between weekend and annual seasonality (1st harmonic)
         wknd_season = is_wknd * fourier_mat[:, :2]
 
-        # Post-2008 macro-economic plateau: ramp from 2005 to 2008, flat thereafter
-        # (prevents confounding the 2010 extreme weather spike with secular linear trend)
+        # Inherited empirical capped time basis, held fixed for controlled comparisons.
+        # It does not identify a macroeconomic cause or a proven 2008 change point.
         t_yr = np.clip(
             df_h["year"].to_numpy(dtype=float)
             + df_h["day_of_year"].to_numpy(dtype=float) / 365.25
@@ -162,10 +224,7 @@ class HourlySplineGAM:
             B_raw = self.spline_raw[hour].transform(t_raw)
 
         # Interaction of temperature spline with weekend/weekday & annual season (summer/winter sensitivity shift)
-        dow = df_h["dayofweek"].to_numpy().copy()
-        if self.use_holiday_correction:
-            dow[df_h["is_major_holiday"].to_numpy() == 1] = 6
-            dow[df_h["is_holiday_bridge"].to_numpy() == 1] = 5
+        dow = self.effective_dayofweek(df_h)
         is_wknd = (dow >= 5).astype(float).reshape(-1, 1)
 
         doy = df_h["day_of_year"].to_numpy(dtype=float)
@@ -215,6 +274,9 @@ class HourlySplineGAM:
         """
         valid_mask = train_mask & df_full["LOAD"].notna().to_numpy()
         valid_idx = np.flatnonzero(valid_mask)
+        if not len(valid_idx):
+            raise ValueError("No labeled training observations")
+        self.fit_end_timestamp = df_full.iloc[valid_idx[-1]]["timestamp"]
         first_valid = max(0, int(valid_idx[0]) - 72)
         last_valid = int(valid_idx[-1]) + 1
 
@@ -229,7 +291,7 @@ class HourlySplineGAM:
         years_valid = df_valid["year"].to_numpy(dtype=float)
         doy_valid = df_valid["day_of_year"].to_numpy(dtype=float)
         dow_valid = df_valid["dayofweek"].to_numpy()
-        max_year = float(years_valid.max())
+        train_end = df_valid["timestamp"].max()
 
         for h in range(1, 25):
             h_pos = np.flatnonzero(hours_valid == h)
@@ -240,7 +302,7 @@ class HourlySplineGAM:
             X_h = self._build_design_matrix(df_h, t_feats_h, hour=h, fit_splines=True)
 
             # Exponential recency sample weights
-            age_years = max_year - (years_valid[h_pos] + doy_valid[h_pos] / 365.25)
+            age_years = (train_end - df_h["timestamp"]).dt.total_seconds().to_numpy() / (365.25 * 86400)
             weights = np.power(0.5, np.maximum(0.0, age_years) / self.recency_half_life_years)
 
             model = RidgeCV(alphas=self.ridge_alphas)
@@ -264,7 +326,7 @@ class HourlySplineGAM:
 
             res_recent = res[recent_mask]
             self.residual_std[h] = float(np.std(res_recent))
-            is_wknd_h = (dow_valid[h_pos] >= 5).astype(int)
+            is_wknd_h = (self.effective_dayofweek(df_h) >= 5).astype(int)
             for wk in (0, 1):
                 sub_res = res[recent_mask & (is_wknd_h == wk)]
                 if len(sub_res) < 30:
@@ -336,55 +398,19 @@ class HourlySplineGAM:
         scenario_years: Sequence[int],
         day_shifts: Sequence[int] = (-6, -4, -2, 0, 2, 4, 6),
     ) -> List[np.ndarray]:
-        """
-        Construct physically coherent temperature scenarios for the target window by extracting
-        historical temperature paths from `scenario_years` around the same day-of-year (+/- `day_shifts` days),
-        stitching them seamlessly after the actual historical temperatures prior to `target_mask`
-        so that building thermal inertia features at the month boundary remain physically continuous.
-        """
+        """Copy complete past weather paths. The join to observed history can jump."""
         target_indices = np.flatnonzero(target_mask)
-        start_idx = int(target_indices[0])
-        horizon = len(target_indices)
-
-        df_target = df_full.iloc[target_indices]
-        start_doy = int(df_target["day_of_year"].iloc[0])
-        start_hour = int(df_target["hour"].iloc[0])
-
-        scenarios: List[np.ndarray] = []
-        years_arr = df_full["year"].to_numpy()
-        doy_arr = df_full["day_of_year"].to_numpy()
-        hour_arr = df_full["hour"].to_numpy()
-
-        for yr in scenario_years:
-            for shift in day_shifts:
-                target_doy = start_doy + shift
-                # Wrap day-of-year within 1..365
-                if target_doy < 1:
-                    cand_yr = yr - 1
-                    cand_doy = 365 + target_doy
-                elif target_doy > 365:
-                    cand_yr = yr + 1
-                    cand_doy = target_doy - 365
-                else:
-                    cand_yr = yr
-                    cand_doy = target_doy
-
-                match = np.flatnonzero(
-                    (years_arr == cand_yr) & (doy_arr == cand_doy) & (hour_arr == start_hour)
-                )
-                if len(match) == 0:
-                    continue
-                hist_start = int(match[0])
-                if hist_start + horizon > int(target_indices[0]):
-                    # Do not peek into target period or beyond available history
-                    continue
-
-                scen_temp = temp_series.copy()
-                scen_temp[start_idx : start_idx + horizon] = temp_series[
-                    hist_start : hist_start + horizon
-                ]
-                scenarios.append(scen_temp)
-
+        starts, metadata = historical_scenario_windows(df_full, target_mask, scenario_years, day_shifts)
+        first, horizon = int(target_indices[0]), len(target_indices)
+        self.last_scenario_metadata = metadata
+        scenarios = []
+        for start in starts:
+            path = temp_series[start:start+horizon]
+            if not np.isfinite(path).all():
+                raise ValueError("Historical weather path contains nonfinite values")
+            temp = temp_series.copy()
+            temp[first:first+horizon] = path
+            scenarios.append(temp)
         return scenarios
 
     def compute_pre_origin_diagnostics(
@@ -414,33 +440,9 @@ class HourlySplineGAM:
                 "err_gate": 0.6,
             }
 
-        # Extract Day-1 climatological profile across historical scenarios
-        df_target = df_full.iloc[start_idx : start_idx + 24]
-        start_doy = int(df_target["day_of_year"].iloc[0])
-        start_hour = int(df_target["hour"].iloc[0])
-        years_arr = df_full["year"].to_numpy()
-        doy_arr = df_full["day_of_year"].to_numpy()
-        hour_arr = df_full["hour"].to_numpy()
-
-        day1_scens = []
-        for yr in scenario_years:
-            for shift in day_shifts:
-                target_doy = start_doy + shift
-                if target_doy < 1:
-                    cand_yr, cand_doy = yr - 1, 365 + target_doy
-                elif target_doy > 365:
-                    cand_yr, cand_doy = yr + 1, target_doy - 365
-                else:
-                    cand_yr, cand_doy = yr, target_doy
-                match = np.flatnonzero(
-                    (years_arr == cand_yr) & (doy_arr == cand_doy) & (hour_arr == start_hour)
-                )
-                if len(match) == 0:
-                    continue
-                hist_start = int(match[0])
-                if hist_start + 24 > start_idx:
-                    continue
-                day1_scens.append(temp_series[hist_start : hist_start + 24])
+        # Historical calendar alignment is shared with the forecast path generator.
+        starts, _ = historical_scenario_windows(df_full, target_mask, scenario_years, day_shifts, horizon=24)
+        day1_scens = [temp_series[start:start+24] for start in starts]
 
         scen_day1_mean = np.mean(day1_scens, axis=0) if day1_scens else temp_series[start_idx - 24 : start_idx]
 
@@ -544,37 +546,19 @@ class HourlySplineGAM:
         offset = start_idx - pad_start
 
         df_target = df_full.iloc[start_idx:end_idx]
-        start_doy = int(df_target["day_of_year"].iloc[0])
-        start_hour = int(df_target["hour"].iloc[0])
-
-        years_arr = df_full["year"].to_numpy()
-        doy_arr = df_full["day_of_year"].to_numpy()
-        hour_arr = df_full["hour"].to_numpy()
-
+        if hasattr(self, "fit_end_timestamp") and self.fit_end_timestamp >= df_full.iloc[start_idx]["timestamp"]:
+            raise ValueError("Fitted training history reaches the forecast period")
+        starts, metadata = historical_scenario_windows(df_full, target_mask, scenario_years, day_shifts)
+        self.last_scenario_metadata = metadata
         base_sub = temp_series[pad_start:end_idx]
-        scen_subs: List[np.ndarray] = []
-        for yr in scenario_years:
-            for shift in day_shifts:
-                target_doy = start_doy + shift
-                if target_doy < 1:
-                    cand_yr, cand_doy = yr - 1, 365 + target_doy
-                elif target_doy > 365:
-                    cand_yr, cand_doy = yr + 1, target_doy - 365
-                else:
-                    cand_yr, cand_doy = yr, target_doy
-
-                match = np.flatnonzero(
-                    (years_arr == cand_yr) & (doy_arr == cand_doy) & (hour_arr == start_hour)
-                )
-                if len(match) == 0:
-                    continue
-                hist_start = int(match[0])
-                if hist_start + horizon > start_idx:
-                    continue
-
-                sub = base_sub.copy()
-                sub[offset:] = temp_series[hist_start : hist_start + horizon]
-                scen_subs.append(sub)
+        scen_subs = []
+        for hist_start in starts:
+            path = temp_series[hist_start:hist_start+horizon]
+            if not np.isfinite(path).all():
+                raise ValueError("Historical weather path contains nonfinite values")
+            sub = base_sub.copy()
+            sub[offset:] = path
+            scen_subs.append(sub)
 
         if not scen_subs:
             raise RuntimeError("No valid historical temperature scenarios generated.")
@@ -592,6 +576,8 @@ class HourlySplineGAM:
             sim_w = sim_w / np.sum(sim_w)
         else:
             sim_w = np.full(n_scen, 1.0 / n_scen, dtype=float)
+
+        self.last_scenario_similarity_weights = sim_w.copy()
 
         # Short-term boundary persistence setup
         temp_gate = 1.0
@@ -670,10 +656,7 @@ class HourlySplineGAM:
             t_raw = t_feats_batch["t_raw"].reshape(-1, 1)
             B_raw = self.spline_raw[h].transform(t_raw)
 
-            dow = df_h["dayofweek"].to_numpy().copy()
-            if self.use_holiday_correction:
-                dow[df_h["is_major_holiday"].to_numpy() == 1] = 6
-                dow[df_h["is_holiday_bridge"].to_numpy() == 1] = 5
+            dow = self.effective_dayofweek(df_h)
             is_wknd = np.tile((dow >= 5).astype(float).reshape(-1, 1), (n_scen, 1))
 
             doy = df_h["day_of_year"].to_numpy(dtype=float)
@@ -722,12 +705,18 @@ class HourlySplineGAM:
             y_mean = np.sum(scen_mat * w_mat, axis=0)
 
         if not include_residual_uncertainty:
-            y_quantiles = np.quantile(scen_mat, QUANTILES_99, axis=0).T
+            y_quantiles = np.zeros((horizon, len(QUANTILES_99)))
+            for t in range(horizon):
+                lam = similarity_weight_lambda
+                if similarity_decay_hours is not None:
+                    lam *= 0.5 ** ((t + 1) / similarity_decay_hours)
+                weights = (1.0 - lam) * unif_w + lam * sim_w
+                y_quantiles[t] = weighted_quantile(scen_mat[:, t], weights)
             return np.sort(y_quantiles, axis=1), y_mean
 
         # Convolve scenario predictions with conditional residual quantiles
         hours_t = df_target["hour"].to_numpy()
-        is_wknd_t = (df_target["dayofweek"].to_numpy() >= 5).astype(int)
+        is_wknd_t = (self.effective_dayofweek(df_target) >= 5).astype(int)
 
         res_grid_idx = np.linspace(2, 96, 19, dtype=int)
         n_res = len(res_grid_idx)
@@ -743,29 +732,20 @@ class HourlySplineGAM:
                 res_q = res_q * shrink
 
             combined_samples = (scen_mat[:, t_idx : t_idx + 1] + res_q.reshape(1, -1)).ravel()
-            if similarity_weight_lambda <= 0.0:
-                y_quantiles[t_idx, :] = np.quantile(combined_samples, QUANTILES_99)
-            else:
-                if similarity_decay_hours is None:
-                    lam_cur = similarity_weight_lambda
-                else:
-                    lam_cur = similarity_weight_lambda * (0.5 ** ((t_idx + 1) / similarity_decay_hours))
-                w_t = (1.0 - lam_cur) * unif_w + lam_cur * sim_w
-                joint_w = np.repeat(w_t, n_res) / float(n_res)
-                sorter = np.argsort(combined_samples)
-                s_sorted = combined_samples[sorter]
-                w_sorted = joint_w[sorter]
-                cdf = np.cumsum(w_sorted) - 0.5 * w_sorted
-                cdf = cdf / cdf[-1]
-                y_quantiles[t_idx, :] = np.interp(QUANTILES_99, cdf, s_sorted)
+            lam = similarity_weight_lambda
+            if similarity_decay_hours is not None:
+                lam *= 0.5 ** ((t_idx + 1) / similarity_decay_hours)
+            w_t = (1.0 - lam) * unif_w + lam * sim_w
+            joint_w = np.repeat(w_t, n_res) / float(n_res)
+            y_quantiles[t_idx] = weighted_quantile(combined_samples, joint_w)
 
         return np.sort(y_quantiles, axis=1), y_mean
 
 
-class DirectCalendarQuantileBaseline:
+class CalendarResidualBaseline:
     """
     Baseline without future temperature scenario generation:
-    Directly fits quantile regression (or empirical hourly/calendar quantile profiles)
+    Fits a Ridge calendar center and empirical hour/month residual quantiles
     using only calendar, seasonal Fourier harmonics, and holiday features (since future T_t is unknown).
     """
 
@@ -775,9 +755,9 @@ class DirectCalendarQuantileBaseline:
         self.models: Dict[int, RidgeCV] = {}
         self.res_quantiles: Dict[Tuple[int, int], np.ndarray] = {}
 
-    def fit(self, df_full: pd.DataFrame, train_mask: np.ndarray) -> "DirectCalendarQuantileBaseline":
+    def fit(self, df_full: pd.DataFrame, train_mask: np.ndarray) -> "CalendarResidualBaseline":
         valid_mask = train_mask & df_full["LOAD"].notna().to_numpy()
-        max_year = float(df_full.loc[valid_mask, "year"].max())
+        train_end = df_full.loc[valid_mask, "timestamp"].max()
 
         for h in range(1, 25):
             h_mask = valid_mask & (df_full["hour"].to_numpy() == h)
@@ -785,9 +765,7 @@ class DirectCalendarQuantileBaseline:
             y_h = df_h["LOAD"].to_numpy(dtype=float)
             X_h = self.base_gam._build_calendar_matrix(df_h)
 
-            age_years = max_year - (
-                df_h["year"].to_numpy(dtype=float) + df_h["day_of_year"].to_numpy(dtype=float) / 365.25
-            )
+            age_years = (train_end - df_h["timestamp"]).dt.total_seconds().to_numpy() / (365.25 * 86400)
             weights = np.power(0.5, np.maximum(0.0, age_years) / 3.5)
 
             model = RidgeCV(alphas=(0.1, 1.0, 10.0, 50.0))
@@ -829,3 +807,7 @@ class DirectCalendarQuantileBaseline:
                 y_quantiles[pos, :] = mu_h[idx_in_h] + self.res_quantiles[(h, m)]
 
         return np.sort(y_quantiles, axis=1), y_mean
+
+
+# Compatibility for the original exploratory entry point.
+DirectCalendarQuantileBaseline = CalendarResidualBaseline

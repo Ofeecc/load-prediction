@@ -1,0 +1,186 @@
+{
+  "started_utc": "2026-11-02T10:56:02.094486+00:00",
+  "months": [
+    "2008-01",
+    "2008-02",
+    "2008-03",
+    "2008-04",
+    "2008-05",
+    "2008-06",
+    "2008-07",
+    "2008-08",
+    "2008-09",
+    "2008-10",
+    "2008-11",
+    "2008-12",
+    "2009-01",
+    "2009-02",
+    "2009-03",
+    "2009-04",
+    "2009-05",
+    "2009-06",
+    "2009-07",
+    "2009-08",
+    "2009-09",
+    "2009-10",
+    "2009-11",
+    "2009-12",
+    "2010-10",
+    "2010-11",
+    "2010-12",
+    "2011-01",
+    "2011-02",
+    "2011-03",
+    "2011-04",
+    "2011-05",
+    "2011-06",
+    "2011-07",
+    "2011-08",
+    "2011-09",
+    "2011-10",
+    "2011-11",
+    "2011-12"
+  ],
+  "periods": {
+    "transfer_2008_2009": "Frozen teammate rule transferred to earlier years; retrospective temporal transfer, not a blind future test",
+    "explored_2010_2011": "Previously explored competition months; not an independent holdout"
+  },
+  "configs": {
+    "no_correction": {
+      "correction_geometry": "legacy"
+    },
+    "legacy_unconditional": {
+      "correction_geometry": "legacy",
+      "ar_half_life_hours": 36.0
+    },
+    "legacy_gated": {
+      "correction_geometry": "legacy",
+      "ar_half_life_hours": 36.0,
+      "adaptive_ar_gating": true
+    },
+    "legacy_hybrid": {
+      "correction_geometry": "legacy",
+      "ar_half_life_hours": 36.0,
+      "adaptive_ar_gating": true,
+      "similarity_weight_lambda": 0.35,
+      "similarity_decay_hours": 48.0
+    },
+    "fixed_individual": {
+      "include_load_residual_correction": false,
+      "shrink_residual_uncertainty": false,
+      "ar_half_life_hours": 36.0,
+      "adaptive_ar_gating": false,
+      "correction_geometry": "individual"
+    },
+    "fixed_center": {
+      "include_load_residual_correction": false,
+      "shrink_residual_uncertainty": false,
+      "ar_half_life_hours": 36.0,
+      "adaptive_ar_gating": false,
+      "correction_geometry": "center"
+    },
+    "gated_individual": {
+      "include_load_residual_correction": false,
+      "shrink_residual_uncertainty": false,
+      "ar_half_life_hours": 36.0,
+      "adaptive_ar_gating": true,
+      "correction_geometry": "individual"
+    },
+    "gated_center": {
+      "include_load_residual_correction": false,
+      "shrink_residual_uncertainty": false,
+      "ar_half_life_hours": 36.0,
+      "adaptive_ar_gating": true,
+      "correction_geometry": "center"
+    }
+  },
+  "thresholds": {
+    "jump_scale_F": 3.2,
+    "growing_jump_factor": 0.45,
+    "anomaly_decay_threshold_F": -1.5,
+    "anomaly_decay_scale_F": 2.0,
+    "residual_error_same_sign_weight": 0.6,
+    "opposite_sign_weight": 0.25
+  },
+  "common": {
+    "stations": "25-station equal mean",
+    "day_shifts": [
+      -6,
+      -4,
+      -2,
+      0,
+      2,
+      4,
+      6
+    ],
+    "ar_cutoff_hours": 48.0,
+    "ar_half_life_hours": 36.0,
+    "residual_scale": 0.85,
+    "point_metrics": "predictive median",
+    "trend": "inherited capped 2008 basis, empirical assumption, not causal evidence"
+  },
+  "controls": "Factorial methods change ONLY temperature gating and geometry. Load-residual correction and residual shrinkage are disabled; no similarity weighting.",
+  "no_tuning": "All thresholds/configurations fixed before execution; report every method and month. No winner is chosen to replace defaults.",
+  "git_revision": "ad60298cf81e6ecaf7e44f900b7cc00e392ec001",
+  "git_status": "M .gitignore\n M src/boundary_validation.py\n M src/data_loader.py\n M src/metrics.py\n M src/models.py\n M src/run_experiments.py\n?? tests/",
+  "working_diff_sha256": "8fb2cf75b049d265c3e45d808100a0caa53d8b89b9158c651ad89069ef9c7239",
+  "source_sha256": {
+    "src/__init__.py": "257cb7562237b32dd95208717c8cf50966b04e17b5d28d31c2f4dc4e33be4d57",
+    "src/boundary_validation.py": "285d4c4127ded97c6019c657e3208eebff60342c9308da2e5d503441a45073ec",
+    "src/data_loader.py": "0a8a23fcdd6f720639f8dc82bdf26a1abceb2e6e55950b03158d7c01bc003205",
+    "src/metrics.py": "18e997105b294f4fb6859cd7215149c5bb01e4db0a282733c225dfc76ef780ad",
+    "src/models.py": "c5b23de56e7ad3144c95e36f20257396532c43e7177ee793449681826365dae1",
+    "src/run_experiments.py": "ca8bc41e6ff2f9ed90e76b6abd12ec138a696120612a8c3f4cea6d1a3c199339",
+    "src/station_selection.py": "e8acfff193d37ad5c3fd09cfac4d670b835eeea590c2437603065f4eab04c34d"
+  },
+  "data_sha256": {
+    "Data/Load/Solution to Task 15/solution15_L.csv": "1761c64f0dbe66e725f9a4c081e9378e713271c8bfcebb818cce052fb818f241",
+    "Data/Load/Solution to Task 15/solution15_L_temperature.csv": "122b06b9e02ab71d1e1184368b024f0c7f0b6508f85792a29e67e1f70b2e43b6",
+    "Data/Load/Task 1/L1-benchmark.csv": "2619951310bea38b69efaca4e187ffb355fa0fc7004cb74e96086468ecb71871",
+    "Data/Load/Task 1/L1-train.csv": "0bf39c05a6d8391a6f5b1ae1074c716cf7b31ad13d117ca0f9e8d2384c11de47",
+    "Data/Load/Task 10/L10-benchmark.csv": "9b4a47da741e0cb7c67aa3669621a16adb96c8d56fe4598a0232b9e078ac4718",
+    "Data/Load/Task 10/L10-train.csv": "997ae79718366cfa3536fad18bf8a48df083783dccf96f1fc1e64a17e30d4746",
+    "Data/Load/Task 11/L11-benchmark.csv": "7b75acfa21477d0ca331557e9869b1ebd9a249efa2a0ffc0bef1f1d986181df8",
+    "Data/Load/Task 11/L11-train.csv": "8f4584bc7cc9882ee34f72dd616991e2d6acf5853b9e14d39459b7124dd8c0a7",
+    "Data/Load/Task 12/L12-benchmark.csv": "696037d0e36bbec484a12b78239632618d5b3a788b1750c9fe2de9bf8a109e67",
+    "Data/Load/Task 12/L12-train.csv": "7c598efef1fac452af8de1b7246cda1cb47f201ad898c23738c13d180de1cb45",
+    "Data/Load/Task 13/L13-benchmark.csv": "1f5079b4721987f79ad6db644df189e0f8d30d011af80102d880c8fea4f89322",
+    "Data/Load/Task 13/L13-train.csv": "7cc1d2e0379540cae6938629a9259e0ed62901292b7c8be6e57b135d9c264c19",
+    "Data/Load/Task 14/L14-benchmark.csv": "8b2a47f4775187c4ce157b4df66a9628c525167215d297289db4c7fd32f690dd",
+    "Data/Load/Task 14/L14-train.csv": "62ec2575bf5e437d80da439e56f3c664b754955c96e52e45fe788c1a92d0028f",
+    "Data/Load/Task 15/L15-benchmark.csv": "d200c4c8e985c5229cb8fbdf31b0f5567ffd12ca788029929f982f919f40178b",
+    "Data/Load/Task 15/L15-train.csv": "bae4b101c1dbff421db17d213d8ac340fd83160cebb0bb8f4f5a0da41d277871",
+    "Data/Load/Task 2/L2-benchmark.csv": "3e2e8cb0e16e3d3b306a29213307d1347d3637e5513eb2c055dc316acc7101b1",
+    "Data/Load/Task 2/L2-train.csv": "c1fc3d691b0965588ce08e91a918399eb592a99954136ee19a0f49cd5096f002",
+    "Data/Load/Task 3/L3-benchmark.csv": "43eef1f316f634416e3a8957f3584123238d28e7f1f3fc2d8e48b3f55b999fdb",
+    "Data/Load/Task 3/L3-train.csv": "cf25a2190cc7f7802f2283974de5ddabf2dba11f3bc7f7ce617ad6c73697db26",
+    "Data/Load/Task 4/L4-benchmark.csv": "17b0e372c8aa6af7fd5753b7215cd2cfb6e8acaf0ad8e56e175a160923dd97e5",
+    "Data/Load/Task 4/L4-train.csv": "d7fb2f8b2ffe51e22a4d31f94f247f4d3f06cf65c44e70eb007fc8e38e499575",
+    "Data/Load/Task 5/L5-benchmark.csv": "45b54e84866cafc797d7c0b94e5aab13e8dbff65a81589bb27f28ecf90ff5393",
+    "Data/Load/Task 5/L5-train.csv": "4c019843c556225532341443302131e0d1bedf8a65e691318fb42e5c1392f13e",
+    "Data/Load/Task 6/L6-benchmark.csv": "7a13540c7ff368ede15ec78f594aafced9eaf30882eab6627c8be3080e71cca4",
+    "Data/Load/Task 6/L6-train.csv": "4b16b1d4c1c322ea113876cbcaad6beac48c30ea7badef769b3ea9c171fa893e",
+    "Data/Load/Task 7/L7-benchmark.csv": "a9f0ce76ddd09d477e61b842c95e918d415ec5f976dfa257570a995f5b4672ab",
+    "Data/Load/Task 7/L7-train.csv": "14a0c24ec51fdd994855310cdcf1d8375bd69206bc228759427fee0b95b0b5d1",
+    "Data/Load/Task 8/L8-benchmark.csv": "78c219568a39b1ccfd56a41e8a0bca07243bdc47a46dd7790f00fcb90abb90dc",
+    "Data/Load/Task 8/L8-train.csv": "6900bed36516820a713df9c21176592bafaffc569c3415b8e69d6fbd1545a72d",
+    "Data/Load/Task 9/L9-benchmark.csv": "47c6df2cfd4103e96264a4746e4552ff023f0108a6506b299e9c04f4d99806c3",
+    "Data/Load/Task 9/L9-train.csv": "b86e3ede2c393622ce86a0cb65cb9c3ec47b9300e631696fd088b618be479dd9"
+  },
+  "versions": {
+    "python": "3.12.14",
+    "numpy": "2.5.4",
+    "pandas": "3.0.1",
+    "scipy": "1.18.1",
+    "scikit_learn": "1.9.1"
+  },
+  "save_predictions": true,
+  "limitations": [
+    "Rule was designed using later competition months; earlier transfer is not prospective validation",
+    "In-sample residuals with empirical 0.85 scale and 19 representative samples",
+    "Only one load zone; overlapping historical scenarios are dependent",
+    "Temperature spread preservation does not guarantee load interval calibration"
+  ],
+  "completed_utc": "2026-11-02T10:57:42.276149+00:00",
+  "completed_months": 39
+}

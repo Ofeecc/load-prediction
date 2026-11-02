@@ -57,6 +57,22 @@ def get_us_federal_holidays(year: int) -> Dict[date, str]:
     return holidays
 
 
+def raw_timestamp_token(ts) -> str:
+    ts = pd.Timestamp(ts)
+    return f"{ts.month}{ts.day}{ts.year} {ts.hour}:00"
+
+
+def validate_raw_timestamps(df):
+    for row in df[["timestamp", "task_origin", "raw_ts"]].itertuples(index=False):
+        if row.task_origin == 16:
+            day = row.timestamp - pd.Timedelta(hours=1)
+            expected = f"{day.month}/{day.day}/{day.year} H{day.hour + 1}"
+        else:
+            expected = raw_timestamp_token(row.timestamp)
+        if row.raw_ts != expected:
+            raise ValueError(f"Raw timestamp/order mismatch at {row.timestamp}: {row.raw_ts!r} != {expected!r}")
+
+
 def load_full_gefcom2014_l(data_dir: str | Path = "Data/Load") -> pd.DataFrame:
     """
     Consolidate Task 1..15 training files and Solution to Task 15 into a single
@@ -78,12 +94,13 @@ def load_full_gefcom2014_l(data_dir: str | Path = "Data/Load") -> pd.DataFrame:
 
     for task_id in range(1, 16):
         train_path = base / f"Task {task_id}" / f"L{task_id}-train.csv"
-        with open(train_path, "r", encoding="utf-8", errors="ignore") as f:
+        with open(train_path, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
                 load_val = float(row["LOAD"]) if row["LOAD"] != "" else np.nan
                 entry = {
                     "raw_ts": row["TIMESTAMP"].strip(),
+                    "ZONEID": int(row["ZONEID"]),
                     "LOAD": load_val,
                     "task_origin": task_id,
                 }
@@ -93,7 +110,7 @@ def load_full_gefcom2014_l(data_dir: str | Path = "Data/Load") -> pd.DataFrame:
 
     # Task 15 solution (December 2011 actual load and 25 weather station temperatures)
     sol_path = base / "Solution to Task 15" / "solution15_L_temperature.csv"
-    with open(sol_path, "r", encoding="utf-8", errors="ignore") as f:
+    with open(sol_path, "r", encoding="utf-8") as f:
         reader = csv.reader(f)
         for row in reader:
             if not row or row[2].strip().upper() == "LOAD":
@@ -102,6 +119,7 @@ def load_full_gefcom2014_l(data_dir: str | Path = "Data/Load") -> pd.DataFrame:
             dt_str, hr_str, load_str = row[0].strip(), row[1].strip(), row[2].strip()
             entry = {
                 "raw_ts": f"{dt_str} H{hr_str}",
+                "ZONEID": 1,
                 "LOAD": float(load_str),
                 "task_origin": 16,  # Ground truth of Task 15 (Dec 2011)
             }
@@ -119,6 +137,13 @@ def load_full_gefcom2014_l(data_dir: str | Path = "Data/Load") -> pd.DataFrame:
     # Construct exact timestamps and operational date/hour
     start_ts = pd.Timestamp("2001-01-01 01:00:00")
     df["timestamp"] = pd.date_range(start=start_ts, periods=len(df), freq="h")
+    # Raw dates have unpadded month/day tokens. Reconstructing without checking
+    # would hide reordered or missing rows, including ambiguous 1112011 tokens.
+    validate_raw_timestamps(df)
+    if set(df["ZONEID"].unique()) != {1}:
+        raise ValueError("Expected the single GEFCom2014-L zone (ZONEID=1)")
+    if not np.isfinite(df[weather_cols].to_numpy(float)).all():
+        raise ValueError("Missing/nonfinite weather measurements")
     # Operational time: subtract 1 hour so hours 1..24 of 2001-01-01 all map to 2001-01-01
     op_ts = df["timestamp"] - pd.Timedelta(hours=1)
     df["op_date"] = op_ts.dt.date
@@ -182,11 +207,25 @@ def load_task_benchmark(task_id: int, data_dir: str | Path = "Data/Load") -> np.
     Load the official 99-quantile benchmark forecast for `task_id` (1..15).
     Returns array of shape (H, 99).
     """
+    if not 1 <= task_id <= 15:
+        raise ValueError("task_id must be in 1..15")
     base = Path(data_dir)
     bpath = base / f"Task {task_id}" / f"L{task_id}-benchmark.csv"
     df_b = pd.read_csv(bpath)
     q_cols = [c for c in df_b.columns if c not in ("ZONEID", "TIMESTAMP")]
-    return df_b[q_cols].to_numpy(dtype=float)
+    from src.metrics import QUANTILES_99
+    if len(q_cols) != 99 or not np.allclose(np.array(q_cols, float), QUANTILES_99):
+        raise ValueError("Benchmark quantile columns must be ordered 0.01..0.99")
+    origin = pd.Timestamp("2010-10-01") + pd.DateOffset(months=task_id - 1)
+    end = origin + pd.DateOffset(months=1)
+    expected = pd.date_range(origin + pd.Timedelta(hours=1), end, freq="h")
+    tokens = [raw_timestamp_token(t) for t in expected]
+    if list(df_b["TIMESTAMP"]) != tokens or not (df_b["ZONEID"] == 1).all():
+        raise ValueError("Benchmark dates/zone do not match the target operational month")
+    result = df_b[q_cols].to_numpy(dtype=float)
+    if not np.isfinite(result).all() or np.any(np.diff(result, axis=1) < 0):
+        raise ValueError("Invalid benchmark quantiles")
+    return result
 
 
 if __name__ == "__main__":

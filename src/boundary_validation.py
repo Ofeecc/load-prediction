@@ -117,7 +117,7 @@ def run(output,months,save_predictions=False):
                        "Temperature spread preservation does not guarantee load interval calibration"]}
     (root/"protocol.json").write_text(json.dumps(protocol,ensure_ascii=False,indent=2),encoding="utf-8")
     df=load_full_gefcom2014_l()
-    rows,diagnostics=[],[]
+    rows,diagnostics,scenario_audit=[],[],[]
     for month in months:
         t0=time.monotonic()
         origin=pd.Timestamp(month)
@@ -145,6 +145,18 @@ def run(output,months,save_predictions=False):
             np.savez_compressed(root/"predictions"/f"{month}_truth.npz",timestamp=stamps,y_true=truth)
         for name,config in configurations().items():
             q,_=gam.predict_quantiles_via_scenarios(known,temp,target,years,**config)
+            n=len(gam.last_scenario_metadata)
+            uniform=np.full(n,1/n)
+            lam=config.get("similarity_weight_lambda",0.)
+            half_life=config.get("similarity_decay_hours")
+            first_lam=lam if half_life is None else lam*.5**(1/half_life)
+            last_lam=lam if half_life is None else lam*.5**(len(truth)/half_life)
+            first_weights=(1-first_lam)*uniform+first_lam*gam.last_scenario_similarity_weights
+            last_weights=(1-last_lam)*uniform+last_lam*gam.last_scenario_similarity_weights
+            for metadata,w0,w1 in zip(gam.last_scenario_metadata,first_weights,last_weights):
+                scenario_audit.append(dict(month=month,method=name,first_forecast_timestamp=str(stamps[0]),
+                    weight_first=float(w0),weight_last=float(w1),
+                    effective_scenarios_first=float(1/np.sum(first_weights**2)),**metadata))
             if save_predictions:
                 np.savez_compressed(root/"predictions"/f"{month}_{name}.npz",timestamp=stamps,
                     quantiles=QUANTILES_99,y_quantiles=q,origin=str(origin),method=name)
@@ -154,6 +166,7 @@ def run(output,months,save_predictions=False):
                                  hours=len(truth[selection]),**score))
         summarize(root,rows)
         pd.DataFrame(diagnostics).to_csv(root/"origin_diagnostics.csv",index=False)
+        pd.DataFrame(scenario_audit).to_csv(root/"scenario_audit.csv",index=False)
         print(f"{month}: 8 configurations; {time.monotonic()-t0:.1f}s",flush=True)
     protocol.update(completed_utc=datetime.now(timezone.utc).isoformat(),completed_months=len(months))
     (root/"protocol.json").write_text(json.dumps(protocol,ensure_ascii=False,indent=2),encoding="utf-8")

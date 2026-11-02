@@ -1,0 +1,9 @@
+{
+  "months": 39,
+  "prediction_files_verified": 312,
+  "metric_windows_verified": 1248,
+  "historical_scenarios_verified": 18240,
+  "source_and_data_hashes_match": true,
+  "chronology_and_weights_valid": true,
+  "summary_aggregation_verified": true
+}

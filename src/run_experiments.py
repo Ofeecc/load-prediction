@@ -61,7 +61,7 @@ TASK_MONTHS_15: List[Tuple[int, int, int, str]] = [
 
 
 def run_all_experiments() -> None:
-    out_dir = Path("results")
+    out_dir = Path("results/exploratory_rerun")
     fig_dir = out_dir / "figures"
     tab_dir = out_dir / "tables"
     pred_dir = out_dir / "predictions"
@@ -292,7 +292,7 @@ def run_all_experiments() -> None:
         mu_oracle = gam.predict_point(df, temp_25, mask_test)
         df_t = df.loc[mask_test]
         q_oracle = np.zeros((len(y_true), 99), dtype=float)
-        for idx_row, (h_val, dow_val) in enumerate(zip(df_t["hour"].to_numpy(), df_t["dayofweek"].to_numpy())):
+        for idx_row, (h_val, dow_val) in enumerate(zip(df_t["hour"].to_numpy(), gam.effective_dayofweek(df_t))):
             wk_val = 1 if dow_val >= 5 else 0
             q_oracle[idx_row, :] = mu_oracle[idx_row] + gam.residual_quantiles[(int(h_val), wk_val)] * 0.85
         m6 = evaluate_all_metrics(y_true, q_oracle, mu_oracle)
@@ -736,7 +736,7 @@ def run_all_experiments() -> None:
 
         mu_ora = gam.predict_point(df, temp_25, mask_test)
         q_ora = np.zeros((len(y_true), 99), dtype=float)
-        for idx_row, (h_val, dow_val) in enumerate(zip(df_t["hour"].to_numpy(), df_t["dayofweek"].to_numpy())):
+        for idx_row, (h_val, dow_val) in enumerate(zip(df_t["hour"].to_numpy(), gam.effective_dayofweek(df_t))):
             wk_val = 1 if dow_val >= 5 else 0
             q_ora[idx_row, :] = mu_ora[idx_row] + gam.residual_quantiles[(int(h_val), wk_val)] * 0.85
 
@@ -1053,8 +1053,10 @@ def run_all_experiments() -> None:
     with open(pred_dir / "experiment_manifest.json", "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, ensure_ascii=False)
 
-    print("\nAll experiments, 15-month sequential backtests, figures, and hourly predictions saved in results/!")
+    print("\nExploratory rerun saved in results/exploratory_rerun/; authoritative controlled results are in results/boundary_merged/.")
 
 
 if __name__ == "__main__":
-    run_all_experiments()
+    from threadpoolctl import threadpool_limits
+    with threadpool_limits(limits=1):
+        run_all_experiments()
