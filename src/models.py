@@ -497,6 +497,9 @@ class HourlySplineGAM:
         similarity_weight_lambda: float = 0.0,
         similarity_weight_tau: float = 5.0,
         similarity_decay_hours: Optional[float] = None,
+        correction_geometry: str = "legacy",
+        include_load_residual_correction: bool = True,
+        shrink_residual_uncertainty: bool = True,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Two-stage probabilistic load forecasting:
@@ -511,12 +514,29 @@ class HourlySplineGAM:
         3. Optionally weight historical scenarios by pre-origin temperature similarity (`similarity_weight_lambda` in [0, 1]).
         4. Convolve scenario load distribution with zero-centered conditional residual quantiles.
 
+        correction_geometry="legacy" preserves the original combined gate/spread behavior.
+        "individual" pulls each trajectory towards the recent profile; "center" moves
+        the ensemble center by the same hourly increment for every trajectory.
+        Disable load-residual correction and residual shrinkage for a temperature-only
+        gate x geometry factorial comparison. Preserving temperature spread does not
+        guarantee unchanged load intervals after nonlinear regression.
+
         Returns:
             (y_quantiles [H, 99], y_mean [H])
         """
+        if correction_geometry not in ("legacy", "individual", "center"):
+            raise ValueError("correction_geometry must be legacy, individual or center")
+        if not 0 <= similarity_weight_lambda <= 1:
+            raise ValueError("similarity_weight_lambda must lie in [0, 1]")
+        if ar_cutoff_hours <= 0 or similarity_weight_tau <= 0:
+            raise ValueError("Correction cutoff and similarity bandwidth must be positive")
+        if similarity_decay_hours is not None and similarity_decay_hours <= 0:
+            raise ValueError("Similarity half-life must be positive")
         target_indices = np.flatnonzero(target_mask)
         if len(target_indices) == 0:
             raise RuntimeError("Empty target_mask provided.")
+        if np.any(np.diff(target_indices) != 1):
+            raise ValueError("Forecast target must be a contiguous hourly window")
         start_idx = int(target_indices[0])
         end_idx = int(target_indices[-1]) + 1
         horizon = len(target_indices)
@@ -593,6 +613,8 @@ class HourlySplineGAM:
             h_steps = np.arange(1, horizon + 1, dtype=float)
             cutoff_taper = np.clip(1.0 - (h_steps - 1.0) / ar_cutoff_hours, 0.0, 1.0)
             temp_decay = temp_gate * np.power(0.5, h_steps / ar_half_life_hours) * cutoff_taper
+            if not include_load_residual_correction:
+                err_coeff = 0.0
             err_decay = err_coeff * np.power(0.5, h_steps / (0.5 * ar_half_life_hours)) * cutoff_taper
             diurnal_err = np.resize(recent_errors, horizon)
         else:
@@ -607,12 +629,16 @@ class HourlySplineGAM:
             if temp_decay is not None and last_24h_temp is not None:
                 sub_mod = sub.copy()
                 scen_day1_temp = sub[offset : offset + 24]
-                if adaptive_ar_gating:
-                    # Blend between ensemble-mean shift (variance-preserving) and individual-scenario anchor
+                if correction_geometry == "center":
+                    anchor = ens_day1_mean
+                elif correction_geometry == "individual":
+                    anchor = scen_day1_temp
+                elif adaptive_ar_gating:
+                    # Retain the teammate's original behavior as an explicit reference.
                     anchor = temp_gate * scen_day1_temp + (1.0 - temp_gate) * ens_day1_mean
-                    diurnal_anom = np.resize(last_24h_temp - anchor, horizon)
                 else:
-                    diurnal_anom = np.resize(last_24h_temp - scen_day1_temp, horizon)
+                    anchor = scen_day1_temp
+                diurnal_anom = np.resize(last_24h_temp - anchor, horizon)
                 sub_mod[offset:] += diurnal_anom * temp_decay
                 tf_mod = compute_thermal_features(sub_mod)
                 if freeze_thermal_inertia_after_cutoff:
@@ -711,7 +737,7 @@ class HourlySplineGAM:
             h = int(hours_t[t_idx])
             wk = int(is_wknd_t[t_idx])
             res_q = self.residual_quantiles[(h, wk)][res_grid_idx] * residual_scale
-            if ar_half_life_hours is not None and ar_half_life_hours > 0 and t_idx < ar_cutoff_hours:
+            if shrink_residual_uncertainty and ar_half_life_hours is not None and ar_half_life_hours > 0 and t_idx < ar_cutoff_hours:
                 cutoff_taper = max(0.0, 1.0 - t_idx / ar_cutoff_hours)
                 shrink = 1.0 - 0.25 * temp_gate * (0.5 ** ((t_idx + 1) / ar_half_life_hours)) * cutoff_taper
                 res_q = res_q * shrink
