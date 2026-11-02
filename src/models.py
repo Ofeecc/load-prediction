@@ -4,19 +4,18 @@ Scenario-driven heuristic models for GEFCom2014-L static 1-month ahead load fore
 Core philosophy (avoiding black-box model stacking):
 1. Interpretable 24-Hour Penalized Cubic Spline Additive Model (GAM-style) capturing:
    - Non-linear U-shaped temperature response (heating & cooling degree splines)
-   - Building thermal inertia (short-term lags + 24h/72h exponential moving averages + daily min/max)
-   - Annual seasonal Fourier harmonics & recency-weighted long-term trend
+   - Building thermal inertia (short-term lags + 24h/72h rolling mean splines + daily min/max)
+   - Annual seasonal Fourier harmonics & post-2008 load plateau piece-wise trend
    - Table 5 US Federal Holiday & bridge-day phase-shift into weekend/holiday activity profiles
-2. Two-Stage Orthogonal Uncertainty Decomposition (Scenario Generation):
-   - Stage 1 (Epistemic Weather Path Uncertainty): Resample historical multi-year temperature
-     trajectories (including the 2001-2004 'unlabeled load' weather archive!) with calendar window shifts.
-   - Stage 2 (Aleatoric Behavioral Uncertainty): Convolve scenario load paths with hour-specific
-     heteroscedastic conditional residual quantiles.
-3. Weather Station Selection & Aggregation:
-   - Compare 25-station mean, single-station scan, GCV/Lasso point-optimal subset (Tololo style),
-     and Pinball-Loss Exponentially Weighted Aggregation (EWA, Adada style).
-4. Multi-Horizon Short-Term Persistence Cutoff (Tololo style):
-   - Blend short-term autoregressive residual & thermal persistence over the initial 1..72 hours.
+2. Two-Stage Probabilistic Modeling (Historical Weather Scenarios + Conditional Residuals):
+   - Stage 1 (Weather Trajectory Ensemble): Resample historical multi-year temperature
+     trajectories (including the 2001-2004 unlabeled weather archive) with calendar window shifts.
+   - Stage 2 (Conditional Residual Dispersion): Convolve scenario load paths with zero-centered,
+     hour-and-daytype-specific empirical residual quantiles.
+3. Balancing Historical Scenario Diversity vs. Pre-Origin Recent Information:
+   - Compare equal-weight historical scenarios, recent-similarity weighted scenarios, and hybrid mixtures.
+   - Compare unconditional 48h short-term persistence against pre-origin regime-stability gated correction,
+     distinguishing direct temperature injection (1..48h) from lagged thermal-inertia propagation (49..120h).
 """
 from __future__ import annotations
 
@@ -253,23 +252,27 @@ class HourlySplineGAM:
             res = y_h - y_hat
 
             # Weather-normalized recent regime calibration (last 45 days before target month)
+            # Shifts the conditional predictive center without shifting the zero-centered residual dispersion
             if self.use_regime_calibration and len(res) >= 45:
                 self.recent_offset[h] = float(0.75 * np.median(res[-45:]))
             else:
                 self.recent_offset[h] = 0.0
 
-            res_cal = res - self.recent_offset[h]
             recent_mask = age_years <= 3.0
             if np.sum(recent_mask) < 100:
-                recent_mask = np.ones_like(res_cal, dtype=bool)
+                recent_mask = np.ones_like(res, dtype=bool)
 
-            self.residual_std[h] = float(np.std(res_cal[recent_mask]))
+            res_recent = res[recent_mask]
+            self.residual_std[h] = float(np.std(res_recent))
             is_wknd_h = (dow_valid[h_pos] >= 5).astype(int)
             for wk in (0, 1):
-                sub_res = res_cal[recent_mask & (is_wknd_h == wk)]
+                sub_res = res[recent_mask & (is_wknd_h == wk)]
                 if len(sub_res) < 30:
-                    sub_res = res_cal[recent_mask]
-                self.residual_quantiles[(h, wk)] = np.quantile(sub_res, QUANTILES_99)
+                    sub_res = res_recent
+                # Center the 3-year conditional error distribution around zero median so recent_offset
+                # shifts the predictive center cleanly without being canceled by residual quantiles
+                sub_res_centered = sub_res - float(np.median(sub_res))
+                self.residual_quantiles[(h, wk)] = np.quantile(sub_res_centered, QUANTILES_99)
 
         return self
 
@@ -384,6 +387,100 @@ class HourlySplineGAM:
 
         return scenarios
 
+    def compute_pre_origin_diagnostics(
+        self,
+        df_full: pd.DataFrame,
+        temp_series: np.ndarray,
+        target_mask: np.ndarray,
+        scenario_years: Sequence[int],
+        day_shifts: Sequence[int] = (-6, -4, -2, 0, 2, 4, 6),
+    ) -> Dict[str, float]:
+        """
+        Compute strictly causal (pre-origin, t < start_idx) meteorological & load-residual
+        diagnostics to evaluate whether the boundary regime is stationary/persistent or undergoing
+        a rapid frontal transition / mean reversion toward climatology.
+        """
+        target_indices = np.flatnonzero(target_mask)
+        start_idx = int(target_indices[0])
+        if start_idx < 48:
+            return {
+                "dt_day_abs": 0.0,
+                "dt_day_signed": 0.0,
+                "anom_mag": 0.0,
+                "anom_growth": 0.0,
+                "err_day1_mean": 0.0,
+                "err_day2_mean": 0.0,
+                "temp_gate": 1.0,
+                "err_gate": 0.6,
+            }
+
+        # Extract Day-1 climatological profile across historical scenarios
+        df_target = df_full.iloc[start_idx : start_idx + 24]
+        start_doy = int(df_target["day_of_year"].iloc[0])
+        start_hour = int(df_target["hour"].iloc[0])
+        years_arr = df_full["year"].to_numpy()
+        doy_arr = df_full["day_of_year"].to_numpy()
+        hour_arr = df_full["hour"].to_numpy()
+
+        day1_scens = []
+        for yr in scenario_years:
+            for shift in day_shifts:
+                target_doy = start_doy + shift
+                if target_doy < 1:
+                    cand_yr, cand_doy = yr - 1, 365 + target_doy
+                elif target_doy > 365:
+                    cand_yr, cand_doy = yr + 1, target_doy - 365
+                else:
+                    cand_yr, cand_doy = yr, target_doy
+                match = np.flatnonzero(
+                    (years_arr == cand_yr) & (doy_arr == cand_doy) & (hour_arr == start_hour)
+                )
+                if len(match) == 0:
+                    continue
+                hist_start = int(match[0])
+                if hist_start + 24 > start_idx:
+                    continue
+                day1_scens.append(temp_series[hist_start : hist_start + 24])
+
+        scen_day1_mean = np.mean(day1_scens, axis=0) if day1_scens else temp_series[start_idx - 24 : start_idx]
+
+        t_m2 = temp_series[start_idx - 48 : start_idx - 24]
+        t_m1 = temp_series[start_idx - 24 : start_idx]
+        dt_signed = float(np.mean(t_m1) - np.mean(t_m2))
+        dt_abs = abs(dt_signed)
+
+        anom_m1 = t_m1 - scen_day1_mean
+        anom_mag = float(np.mean(np.abs(anom_m1)))
+        # Intraday anomaly evolution: is departure from seasonal norm strengthening (>=0) or decaying (<0)?
+        anom_growth = float(np.mean(np.abs(anom_m1[12:])) - np.mean(np.abs(anom_m1[:12])))
+
+        # Causal gating weight gamma_temp in [0, 1]:
+        # High day-over-day temperature jumps or decaying intraday anomalies indicate active frontal transition / mean reversion
+        effective_jump = dt_abs if anom_growth < 0.0 else 0.45 * dt_abs
+        temp_gate = float(np.exp(-((effective_jump / 3.2) ** 2)))
+        if anom_growth < -1.5:
+            temp_gate *= float(np.exp(-(((abs(anom_growth) - 1.5) / 2.0) ** 2)))
+
+        pre_mask_48 = np.zeros(len(df_full), dtype=bool)
+        pre_mask_48[start_idx - 48 : start_idx] = True
+        err_48 = df_full.loc[pre_mask_48, "LOAD"].to_numpy(dtype=float) - self.predict_point(
+            df_full, temp_series, pre_mask_48
+        )
+        err_day2 = float(np.mean(err_48[:24]))
+        err_day1 = float(np.mean(err_48[24:48]))
+        err_gate = temp_gate * (0.60 if (err_day1 * err_day2 > 0) else 0.25)
+
+        return {
+            "dt_day_abs": dt_abs,
+            "dt_day_signed": dt_signed,
+            "anom_mag": anom_mag,
+            "anom_growth": anom_growth,
+            "err_day1_mean": err_day1,
+            "err_day2_mean": err_day2,
+            "temp_gate": temp_gate,
+            "err_gate": err_gate,
+        }
+
     def predict_quantiles_via_scenarios(
         self,
         df_full: pd.DataFrame,
@@ -394,101 +491,247 @@ class HourlySplineGAM:
         include_residual_uncertainty: bool = True,
         residual_scale: float = 0.85,
         ar_half_life_hours: Optional[float] = None,
+        ar_cutoff_hours: float = 48.0,
+        adaptive_ar_gating: bool = False,
+        freeze_thermal_inertia_after_cutoff: bool = False,
+        similarity_weight_lambda: float = 0.0,
+        similarity_weight_tau: float = 5.0,
+        similarity_decay_hours: Optional[float] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Two-stage physical probabilistic load forecasting:
-        1. Generate N_scen historical temperature trajectories over `target_mask`.
-        2. Predict conditional load trajectories mu^{(s)}_t for each scenario s.
-        3. Combine scenario distribution with conditional residual quantiles (convolution/mixture)
-           to obtain 99 calibrated load quantiles for every hour in `target_mask`.
-        4. Optionally apply Multi-Horizon Short-Term Persistence correction (decaying with `ar_half_life_hours`)
-           using the known actual load & temperature at t = start_idx - 1..start_idx - 24.
+        Two-stage probabilistic load forecasting:
+        1. Extract N_scen historical temperature trajectories over `target_mask` (with 72h pre-boundary lookback).
+        2. Optionally apply short-term boundary correction over `1..ar_cutoff_hours`:
+           - If `adaptive_ar_gating=False`: unconditional persistence blend (weight=1.0).
+           - If `adaptive_ar_gating=True`: pre-origin regime-stability gated blend (weight=gamma(t_0) in [0, 1]),
+             shifting the scenario ensemble center while preserving (1 - gamma) of the inter-scenario spread.
+           - Note on thermal inertia propagation: even when direct temperature injection ends at `ar_cutoff_hours` (48h),
+             the 24h and 72h rolling temperature means (`t_mean24`, `t_mean72`) naturally propagate the modified
+             1..48h temperatures into hours 49..120 unless `freeze_thermal_inertia_after_cutoff=True`.
+        3. Optionally weight historical scenarios by pre-origin temperature similarity (`similarity_weight_lambda` in [0, 1]).
+        4. Convolve scenario load distribution with zero-centered conditional residual quantiles.
 
         Returns:
             (y_quantiles [H, 99], y_mean [H])
         """
-        scenarios = self.generate_temperature_scenarios(
-            df_full=df_full,
-            temp_series=temp_series,
-            target_mask=target_mask,
-            scenario_years=scenario_years,
-            day_shifts=day_shifts,
-        )
-        if not scenarios:
+        target_indices = np.flatnonzero(target_mask)
+        if len(target_indices) == 0:
+            raise RuntimeError("Empty target_mask provided.")
+        start_idx = int(target_indices[0])
+        end_idx = int(target_indices[-1]) + 1
+        horizon = len(target_indices)
+        pad_start = max(0, start_idx - 72)
+        offset = start_idx - pad_start
+
+        df_target = df_full.iloc[start_idx:end_idx]
+        start_doy = int(df_target["day_of_year"].iloc[0])
+        start_hour = int(df_target["hour"].iloc[0])
+
+        years_arr = df_full["year"].to_numpy()
+        doy_arr = df_full["day_of_year"].to_numpy()
+        hour_arr = df_full["hour"].to_numpy()
+
+        base_sub = temp_series[pad_start:end_idx]
+        scen_subs: List[np.ndarray] = []
+        for yr in scenario_years:
+            for shift in day_shifts:
+                target_doy = start_doy + shift
+                if target_doy < 1:
+                    cand_yr, cand_doy = yr - 1, 365 + target_doy
+                elif target_doy > 365:
+                    cand_yr, cand_doy = yr + 1, target_doy - 365
+                else:
+                    cand_yr, cand_doy = yr, target_doy
+
+                match = np.flatnonzero(
+                    (years_arr == cand_yr) & (doy_arr == cand_doy) & (hour_arr == start_hour)
+                )
+                if len(match) == 0:
+                    continue
+                hist_start = int(match[0])
+                if hist_start + horizon > start_idx:
+                    continue
+
+                sub = base_sub.copy()
+                sub[offset:] = temp_series[hist_start : hist_start + horizon]
+                scen_subs.append(sub)
+
+        if not scen_subs:
             raise RuntimeError("No valid historical temperature scenarios generated.")
 
-        target_indices = np.flatnonzero(target_mask)
-        horizon = len(target_indices)
+        n_scen = len(scen_subs)
+        last_24h_temp = temp_series[start_idx - 24 : start_idx].copy() if start_idx >= 24 else None
 
-        # Short-term persistence anchor at the boundary right before the forecast month
-        start_idx = int(target_indices[0])
-        if ar_half_life_hours is not None and ar_half_life_hours > 0 and start_idx >= 24:
-            # Compute recent 24-hour load residual & diurnal temperature profile right before forecast start
+        # Compute pre-origin scenario similarity weights if requested
+        if similarity_weight_lambda > 0.0 and last_24h_temp is not None:
+            dists = np.array(
+                [np.sqrt(np.mean((s[offset : offset + 24] - last_24h_temp) ** 2)) for s in scen_subs],
+                dtype=float,
+            )
+            sim_w = np.exp(-0.5 * ((dists - np.min(dists)) / max(0.5, similarity_weight_tau)) ** 2)
+            sim_w = sim_w / np.sum(sim_w)
+        else:
+            sim_w = np.full(n_scen, 1.0 / n_scen, dtype=float)
+
+        # Short-term boundary persistence setup
+        temp_gate = 1.0
+        err_coeff = 0.60
+        if ar_half_life_hours is not None and ar_half_life_hours > 0 and start_idx >= 24 and last_24h_temp is not None:
+            if adaptive_ar_gating:
+                diag = self.compute_pre_origin_diagnostics(
+                    df_full, temp_series, target_mask, scenario_years, day_shifts
+                )
+                temp_gate = diag["temp_gate"]
+                err_coeff = diag["err_gate"]
+
             pre_mask = np.zeros(len(df_full), dtype=bool)
             pre_mask[start_idx - 24 : start_idx] = True
             y_pre_true = df_full.loc[pre_mask, "LOAD"].to_numpy(dtype=float)
             y_pre_hat = self.predict_point(df_full, temp_series, pre_mask)
             recent_errors = y_pre_true - y_pre_hat
-            # Diurnal temperature profile of the last observed 24 hours (t = start_idx - 24 .. start_idx - 1)
-            last_24h_temp = temp_series[start_idx - 24 : start_idx].copy()
+
+            h_steps = np.arange(1, horizon + 1, dtype=float)
+            cutoff_taper = np.clip(1.0 - (h_steps - 1.0) / ar_cutoff_hours, 0.0, 1.0)
+            temp_decay = temp_gate * np.power(0.5, h_steps / ar_half_life_hours) * cutoff_taper
+            err_decay = err_coeff * np.power(0.5, h_steps / (0.5 * ar_half_life_hours)) * cutoff_taper
+            diurnal_err = np.resize(recent_errors, horizon)
         else:
-            recent_errors = np.zeros(24, dtype=float)
-            last_24h_temp = None
+            temp_decay = None
+            err_decay = None
+            diurnal_err = None
 
-        scen_preds = []
-        for s_temp in scenarios:
-            if ar_half_life_hours is not None and ar_half_life_hours > 0 and last_24h_temp is not None:
-                # Tololo-style 48h Short/Medium-Term Cutoff:
-                # Blend initial hours (1..48h) of scenario temperature from the actual last-24h diurnal profile
-                # into the scenario's own trajectory, tapering smoothly to 0 at hour 48 so medium-term (>=49h)
-                # synoptic transitions are uncontaminated.
-                s_temp = s_temp.copy()
-                h_steps = np.arange(1, horizon + 1, dtype=float)
-                cutoff_taper = np.clip(1.0 - (h_steps - 1.0) / 48.0, 0.0, 1.0)
-                temp_decay = np.power(0.5, h_steps / ar_half_life_hours) * cutoff_taper
-                scen_day1_temp = s_temp[start_idx : start_idx + 24]
-                diurnal_anom = np.resize(last_24h_temp - scen_day1_temp, horizon)
-                s_temp[start_idx : start_idx + horizon] += diurnal_anom * temp_decay
+        # Compute thermal inertia features per scenario (and optionally freeze propagation after cutoff)
+        t_feats_list = []
+        ens_day1_mean = np.mean([s[offset : offset + 24] for s in scen_subs], axis=0)
+        for sub in scen_subs:
+            if temp_decay is not None and last_24h_temp is not None:
+                sub_mod = sub.copy()
+                scen_day1_temp = sub[offset : offset + 24]
+                if adaptive_ar_gating:
+                    # Blend between ensemble-mean shift (variance-preserving) and individual-scenario anchor
+                    anchor = temp_gate * scen_day1_temp + (1.0 - temp_gate) * ens_day1_mean
+                    diurnal_anom = np.resize(last_24h_temp - anchor, horizon)
+                else:
+                    diurnal_anom = np.resize(last_24h_temp - scen_day1_temp, horizon)
+                sub_mod[offset:] += diurnal_anom * temp_decay
+                tf_mod = compute_thermal_features(sub_mod)
+                if freeze_thermal_inertia_after_cutoff:
+                    tf_raw = compute_thermal_features(sub)
+                    cut_idx = offset + int(ar_cutoff_hours)
+                    for k in tf_mod:
+                        arr_k = tf_mod[k].copy()
+                        arr_k[cut_idx:] = tf_raw[k][cut_idx:]
+                        tf_mod[k] = arr_k
+                t_feats_list.append({k: v[offset:] for k, v in tf_mod.items()})
+            else:
+                tf = compute_thermal_features(sub)
+                t_feats_list.append({k: v[offset:] for k, v in tf.items()})
 
-            pred_s = self.predict_point(df_full, s_temp, target_mask)
+        # Batched evaluation across all N_scen scenarios for each hour h=1..24
+        hours_target = df_target["hour"].to_numpy()
+        scen_mat = np.zeros((n_scen, horizon), dtype=float)
 
-            if ar_half_life_hours is not None and ar_half_life_hours > 0 and last_24h_temp is not None:
-                h_steps = np.arange(1, horizon + 1, dtype=float)
-                cutoff_taper = np.clip(1.0 - (h_steps - 1.0) / 48.0, 0.0, 1.0)
-                err_decay = np.power(0.5, h_steps / (0.5 * ar_half_life_hours)) * cutoff_taper
-                diurnal_err = np.resize(recent_errors, horizon)
-                pred_s = pred_s + 0.6 * diurnal_err * err_decay
+        for h in range(1, 25):
+            local_pos = np.flatnonzero(hours_target == h)
+            if len(local_pos) == 0:
+                continue
+            df_h = df_target.iloc[local_pos]
+            cal_X = np.tile(self._build_calendar_matrix(df_h), (n_scen, 1))
+            t_feats_batch = {
+                k: np.concatenate([tf[k][local_pos] for tf in t_feats_list])
+                for k in t_feats_list[0].keys()
+            }
+            t_raw = t_feats_batch["t_raw"].reshape(-1, 1)
+            B_raw = self.spline_raw[h].transform(t_raw)
 
-            scen_preds.append(pred_s)
+            dow = df_h["dayofweek"].to_numpy().copy()
+            if self.use_holiday_correction:
+                dow[df_h["is_major_holiday"].to_numpy() == 1] = 6
+                dow[df_h["is_holiday_bridge"].to_numpy() == 1] = 5
+            is_wknd = np.tile((dow >= 5).astype(float).reshape(-1, 1), (n_scen, 1))
 
-        # Shape: (N_scen, H)
-        scen_mat = np.vstack(scen_preds)
-        y_mean = np.mean(scen_mat, axis=0)
+            doy = df_h["day_of_year"].to_numpy(dtype=float)
+            omega = (2.0 * np.pi * doy / 365.25).reshape(-1, 1)
+            sin1 = np.tile(np.sin(omega), (n_scen, 1))
+            cos1 = np.tile(np.cos(omega), (n_scen, 1))
+
+            parts = [cal_X, B_raw, B_raw * is_wknd, B_raw * sin1, B_raw * cos1]
+            if self.use_thermal_inertia:
+                B_m24 = self.spline_m24[h].transform(t_feats_batch["t_mean24"].reshape(-1, 1))
+                B_m72 = self.spline_m72[h].transform(t_feats_batch["t_mean72"].reshape(-1, 1))
+                lag_mat = np.column_stack(
+                    [
+                        t_feats_batch["t_lag1"],
+                        t_feats_batch["t_lag2"],
+                        t_feats_batch["t_lag3"],
+                        t_feats_batch["t_lag6"],
+                        t_feats_batch["t_lag24"],
+                        t_feats_batch["t_max24"],
+                        t_feats_batch["t_min24"],
+                        t_feats_batch["t_diff24"],
+                    ]
+                )
+                parts.extend([B_m24, B_m72, lag_mat])
+
+            X_batch = np.hstack(parts)
+            preds_h = (self.models[h].predict(X_batch) + self.recent_offset.get(h, 0.0)).reshape(
+                n_scen, len(local_pos)
+            )
+            scen_mat[:, local_pos] = preds_h
+
+        if diurnal_err is not None and err_decay is not None:
+            scen_mat = scen_mat + diurnal_err * err_decay
+
+        # Compute scenario weights per horizon step t_idx
+        unif_w = np.full(n_scen, 1.0 / n_scen, dtype=float)
+        if similarity_weight_lambda <= 0.0:
+            y_mean = np.mean(scen_mat, axis=0)
+        elif similarity_decay_hours is None:
+            w_static = (1.0 - similarity_weight_lambda) * unif_w + similarity_weight_lambda * sim_w
+            y_mean = np.sum(scen_mat * w_static[:, None], axis=0)
+        else:
+            h_steps = np.arange(1, horizon + 1, dtype=float)
+            lam_t = similarity_weight_lambda * np.power(0.5, h_steps / similarity_decay_hours)
+            w_mat = (1.0 - lam_t[None, :]) * unif_w[:, None] + lam_t[None, :] * sim_w[:, None]
+            y_mean = np.sum(scen_mat * w_mat, axis=0)
 
         if not include_residual_uncertainty:
             y_quantiles = np.quantile(scen_mat, QUANTILES_99, axis=0).T
             return np.sort(y_quantiles, axis=1), y_mean
 
         # Convolve scenario predictions with conditional residual quantiles
-        df_target = df_full.iloc[target_indices]
         hours_t = df_target["hour"].to_numpy()
         is_wknd_t = (df_target["dayofweek"].to_numpy() >= 5).astype(int)
 
-        # Representative residual samples (19 percentiles from residual distribution) per scenario
         res_grid_idx = np.linspace(2, 96, 19, dtype=int)
+        n_res = len(res_grid_idx)
         y_quantiles = np.zeros((horizon, len(QUANTILES_99)), dtype=float)
 
         for t_idx in range(horizon):
             h = int(hours_t[t_idx])
             wk = int(is_wknd_t[t_idx])
             res_q = self.residual_quantiles[(h, wk)][res_grid_idx] * residual_scale
-            # In the first 48h when AR correction is active, conditional uncertainty is slightly tighter
-            if ar_half_life_hours is not None and ar_half_life_hours > 0 and t_idx < 48:
-                cutoff_taper = max(0.0, 1.0 - t_idx / 48.0)
-                shrink = 1.0 - 0.25 * (0.5 ** ((t_idx + 1) / ar_half_life_hours)) * cutoff_taper
+            if ar_half_life_hours is not None and ar_half_life_hours > 0 and t_idx < ar_cutoff_hours:
+                cutoff_taper = max(0.0, 1.0 - t_idx / ar_cutoff_hours)
+                shrink = 1.0 - 0.25 * temp_gate * (0.5 ** ((t_idx + 1) / ar_half_life_hours)) * cutoff_taper
                 res_q = res_q * shrink
+
             combined_samples = (scen_mat[:, t_idx : t_idx + 1] + res_q.reshape(1, -1)).ravel()
-            y_quantiles[t_idx, :] = np.quantile(combined_samples, QUANTILES_99)
+            if similarity_weight_lambda <= 0.0:
+                y_quantiles[t_idx, :] = np.quantile(combined_samples, QUANTILES_99)
+            else:
+                if similarity_decay_hours is None:
+                    lam_cur = similarity_weight_lambda
+                else:
+                    lam_cur = similarity_weight_lambda * (0.5 ** ((t_idx + 1) / similarity_decay_hours))
+                w_t = (1.0 - lam_cur) * unif_w + lam_cur * sim_w
+                joint_w = np.repeat(w_t, n_res) / float(n_res)
+                sorter = np.argsort(combined_samples)
+                s_sorted = combined_samples[sorter]
+                w_sorted = joint_w[sorter]
+                cdf = np.cumsum(w_sorted) - 0.5 * w_sorted
+                cdf = cdf / cdf[-1]
+                y_quantiles[t_idx, :] = np.interp(QUANTILES_99, cdf, s_sorted)
 
         return np.sort(y_quantiles, axis=1), y_mean
 
